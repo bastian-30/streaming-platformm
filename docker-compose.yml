@@ -1,0 +1,109 @@
+services:
+  # ─────────────────────────── Base de datos ───────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: streaming-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-streaming_platform}
+      POSTGRES_USER: ${POSTGRES_USER:-streaming_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-streaming_local_password}
+    ports:
+      - "5433:5432"
+    volumes:
+      - streaming_pgdata:/var/lib/postgresql/data
+      - ./backend/sql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-streaming_user} -d ${POSTGRES_DB:-streaming_platform}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - streaming-net
+
+  # ─────────────────────────── API (Express) ───────────────────────────
+  backend:
+    build:
+      context: ./backend
+    image: streaming-platform/backend
+    container_name: streaming-backend
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: 3001
+      DATABASE_URL: postgresql://${POSTGRES_USER:-streaming_user}:${POSTGRES_PASSWORD:-streaming_local_password}@postgres:5432/${POSTGRES_DB:-streaming_platform}
+      JWT_SECRET: ${JWT_SECRET:?Define JWT_SECRET en el archivo .env de la raíz}
+      JWT_EXPIRES_IN: ${JWT_EXPIRES_IN:-8h}
+      CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:8080,http://localhost:5173}
+      UPLOAD_DIR: /app/uploads
+      MAX_UPLOAD_SIZE_MB: ${MAX_UPLOAD_SIZE_MB:-50}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      # URL de Ant Media tal como la ve el navegador (puerto publicado)
+      ANTMEDIA_BASE_URL: ${ANTMEDIA_BASE_URL:-http://localhost:5080/LiveApp}
+    ports:
+      - "3001:3001"
+    volumes:
+      # Almacenamiento persistente de archivos multimedia
+      - streaming_uploads:/app/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3001/api/health > /dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - streaming-net
+
+  # ─────────────────────────── PWA (nginx) ─────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        # La API se consume vía proxy de nginx (mismo origen, sin CORS)
+        VITE_API_URL: /api
+    image: streaming-platform/frontend
+    container_name: streaming-frontend
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/ > /dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      - streaming-net
+
+  # ─────────────────────────── Integración preparada: Ant Media Server ──
+  # Descomenta este bloque para habilitar la emisión en directo.
+  # El backend ya genera las URLs de reproducción HLS/WebRTC a partir de
+  # ANTMEDIA_BASE_URL y guarda el stream_id de cada transmisión.
+  #
+  # antmedia:
+  #   image: antmedia/community:2.14.0
+  #   container_name: streaming-antmedia
+  #   restart: unless-stopped
+  #   ports:
+  #     - "5080:5080"     # panel web, REST y WebSocket
+  #     - "1935:1935"     # ingesta RTMP (OBS, ffmpeg)
+  #   volumes:
+  #     - streaming_antmedia:/usr/local/antmedia
+  #   networks:
+  #     - streaming-net
+
+volumes:
+  streaming_pgdata:
+  streaming_uploads:
+  # streaming_antmedia:
+
+networks:
+  streaming-net:
+    driver: bridge
